@@ -1,113 +1,298 @@
 import streamlit as st
 import pandas as pd
+import requests
 import plotly.express as px
-import plotly.graph_objects as go
-import os
+from googleapiclient.discovery import build
+from datetime import datetime, timedelta
 
-# 페이지 설정
-st.set_page_config(page_title="영화 흥행 요인 분석 대시보드", layout="wide")
+st.set_page_config(page_title="실시간 영화 분석", layout="wide")
 
-# 데이터 로드 함수
-@st.cache_data
-def load_data():
-    master_path = "data/processed/movie_master_dataset.csv"
-    daily_path = "data/processed/boxoffice_daily_dataset.csv"
-    
-    df_master = pd.read_csv(master_path)
-    df_daily = pd.read_csv(daily_path)
-    
-    # 날짜 데이터 변환
-    df_master['release_date'] = pd.to_datetime(df_master['release_date'])
-    df_daily['date'] = pd.to_datetime(df_daily['date'])
-    
-    return df_master, df_daily
+KOBIS_API_KEY = st.secrets["KOBIS_API_KEY"]
+TMDB_API_KEY = st.secrets["TMDB_API_KEY"]
+YOUTUBE_API_KEY = st.secrets["YOUTUBE_API_KEY"]
 
-# 데이터 불러오기
-try:
-    df_master, df_daily = load_data()
-    
-    # 사이드바 설정
-    st.sidebar.title("🎬 영화 분석 대시보드")
-    st.sidebar.markdown("### 분석 대상 영화")
-    selected_movies = st.sidebar.multiselect(
-        "비교할 영화를 선택하세요",
-        options=df_master['movie_title'].unique(),
-        default=df_master['movie_title'].unique()
-    )
+# 화면 표시명과 실제 API 검색용 이름을 분리
+MOVIE_MAP = {
+    "왕과 사는 남자": {
+        "display_name": "왕과 사는 남자",
+        "tmdb_query": "왕과 남자",
+        "kobis_name": "왕과 남자",
+        "youtube_queries": ["왕과 남자 예고편", "The King and the Clown trailer"],
+    },
+    "명량": {
+        "display_name": "명량",
+        "tmdb_query": "명량",
+        "kobis_name": "명량",
+        "youtube_queries": ["명량 예고편", "Roaring Currents trailer"],
+    },
+    "사도": {
+        "display_name": "사도",
+        "tmdb_query": "사도",
+        "kobis_name": "사도",
+        "youtube_queries": ["사도 예고편", "The Throne trailer"],
+    },
+    "기생충": {
+        "display_name": "기생충",
+        "tmdb_query": "기생충",
+        "kobis_name": "기생충",
+        "youtube_queries": ["기생충 예고편", "Parasite trailer"],
+    },
+}
 
-    # 필터링된 데이터
-    filtered_master = df_master[df_master['movie_title'].isin(selected_movies)]
-    filtered_daily = df_daily[df_daily['movie_title'].isin(selected_movies)]
 
-    # 메인 타이틀
-    st.title("🎥 영화 '왕과 사는 남자' 천만 달성 성공 요인 분석")
-    st.markdown("수집된 KOBIS, TMDB, YouTube 데이터를 활용한 통합 분석 대시보드입니다.")
+@st.cache_data(ttl=3600)
+def fetch_tmdb_movie(query: str):
+    search_url = "https://api.themoviedb.org/3/search/movie"
+    params = {
+        "api_key": TMDB_API_KEY,
+        "query": query,
+        "language": "ko-KR",
+    }
+    res = requests.get(search_url, params=params, timeout=20)
+    res.raise_for_status()
+    results = res.json().get("results", [])
 
-    # 주요 지표 (KPI) - 왕과 사는 남자 기준
-    target_movie = "왕과 사는 남자"
-    if target_movie in df_master['movie_title'].values:
-        movie_info = df_master[df_master['movie_title'] == target_movie].iloc[0]
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("총 관객수", f"{movie_info['total_audience']:,}명")
-        col2.metric("TMDB 인기도", f"{movie_info['popularity']:.1f}")
-        col3.metric("예고편 조회수", f"{movie_info['total_trailer_views']:,}회")
-        col4.metric("러닝타임", f"{movie_info['runtime']}분")
+    if not results:
+        return None
 
-    st.divider()
+    # 첫 결과 사용. 필요하면 release_date 기준 보정 가능
+    movie = results[0]
+    movie_id = movie["id"]
 
-    # 시각화 영역 - 1열
-    row1_col1, row1_col2 = st.columns(2)
+    detail_url = f"https://api.themoviedb.org/3/movie/{movie_id}"
+    detail_params = {
+        "api_key": TMDB_API_KEY,
+        "language": "ko-KR",
+    }
+    detail_res = requests.get(detail_url, params=detail_params, timeout=20)
+    detail_res.raise_for_status()
+    detail = detail_res.json()
 
-    with row1_col1:
-        st.subheader("1. 영화별 총 관객수 비교")
-        fig_total = px.bar(filtered_master, x='movie_title', y='total_audience',
-                           color='movie_title', text_auto='.2s',
-                           title="누적 관객수 현황")
-        st.plotly_chart(fig_total, use_container_width=True)
+    genres = ", ".join([g["name"] for g in detail.get("genres", [])])
 
-    with row1_col2:
-        st.subheader("2. TMDB 평점 비교")
-        fig_vote = px.bar(filtered_master, x='movie_title', y='vote_average',
-                          color='movie_title', range_y=[0, 10],
-                          title="관객/평단 인기도 (TMDB Vote Average)")
-        st.plotly_chart(fig_vote, use_container_width=True)
+    return {
+        "movie_id": movie_id,
+        "title": detail.get("title", query),
+        "release_date": detail.get("release_date"),
+        "vote_average": float(detail.get("vote_average", 0) or 0),
+        "vote_count": int(detail.get("vote_count", 0) or 0),
+        "popularity": float(detail.get("popularity", 0) or 0),
+        "runtime": int(detail.get("runtime", 0) or 0),
+        "genres": genres,
+        "overview": detail.get("overview", ""),
+    }
 
-    # 시각화 영역 - 2열
-    row2_col1, row2_col2 = st.columns(2)
 
-    with row2_col1:
-        st.subheader("3. YouTube 공식 예고편 조회수")
-        fig_yt = px.pie(filtered_master, values='total_trailer_views', names='movie_title',
-                        hole=0.4, title="영화별 트레일러 화제성 점유율")
+def make_empty_kobis_df():
+    return pd.DataFrame(columns=[
+        "날짜",
+        "영화명",
+        "일별관객수",
+        "누적관객수",
+        "스크린수",
+        "상영횟수",
+        "순위",
+    ])
+
+
+@st.cache_data(ttl=3600)
+def fetch_kobis_boxoffice(movie_name: str, release_date: str | None, days: int = 120):
+    """
+    개봉일 기준으로 KOBIS 일별 박스오피스를 수집한다.
+    release_date가 없으면 빈 DataFrame 반환.
+    """
+    if not release_date:
+        return make_empty_kobis_df()
+
+    try:
+        start_date = datetime.strptime(release_date, "%Y-%m-%d")
+    except ValueError:
+        return make_empty_kobis_df()
+
+    data = []
+
+    for i in range(days):
+        current_date = start_date + timedelta(days=i)
+        target_dt = current_date.strftime("%Y%m%d")
+
+        url = "http://www.kobis.or.kr/kobisopenapi/webservice/rest/boxoffice/searchDailyBoxOfficeList.json"
+        params = {
+            "key": KOBIS_API_KEY,
+            "targetDt": target_dt,
+        }
+
+        try:
+            res = requests.get(url, params=params, timeout=20)
+            res.raise_for_status()
+            json_data = res.json()
+        except Exception:
+            continue
+
+        daily_list = json_data.get("boxOfficeResult", {}).get("dailyBoxOfficeList", [])
+
+        for item in daily_list:
+            if item.get("movieNm") == movie_name:
+                data.append({
+                    "날짜": current_date.strftime("%Y-%m-%d"),
+                    "영화명": item.get("movieNm"),
+                    "일별관객수": int(item.get("audiCnt", 0) or 0),
+                    "누적관객수": int(item.get("audiAcc", 0) or 0),
+                    "스크린수": int(item.get("scrnCnt", 0) or 0),
+                    "상영횟수": int(item.get("showCnt", 0) or 0),
+                    "순위": int(item.get("rank", 0) or 0),
+                })
+
+    df = pd.DataFrame(data)
+
+    if df.empty:
+        return make_empty_kobis_df()
+
+    if "날짜" in df.columns:
+        df = df.sort_values("날짜").reset_index(drop=True)
+
+    return df
+
+
+@st.cache_data(ttl=3600)
+def fetch_youtube_stats(queries: list[str]):
+    youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+    rows = []
+
+    for query in queries:
+        try:
+            search_res = youtube.search().list(
+                q=query,
+                part="snippet",
+                maxResults=5,
+                type="video",
+            ).execute()
+        except Exception:
+            continue
+
+        video_ids = [item["id"]["videoId"] for item in search_res.get("items", [])]
+        if not video_ids:
+            continue
+
+        try:
+            stats_res = youtube.videos().list(
+                id=",".join(video_ids),
+                part="snippet,statistics",
+            ).execute()
+        except Exception:
+            continue
+
+        for item in stats_res.get("items", []):
+            rows.append({
+                "video_id": item["id"],
+                "title": item["snippet"].get("title", ""),
+                "channel_title": item["snippet"].get("channelTitle", ""),
+                "published_at": item["snippet"].get("publishedAt", ""),
+                "view_count": int(item.get("statistics", {}).get("viewCount", 0) or 0),
+                "like_count": int(item.get("statistics", {}).get("likeCount", 0) or 0),
+                "comment_count": int(item.get("statistics", {}).get("commentCount", 0) or 0),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "video_id", "title", "channel_title", "published_at",
+            "view_count", "like_count", "comment_count"
+        ])
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["video_id"])
+    return df.sort_values("view_count", ascending=False).reset_index(drop=True)
+
+
+def build_metrics(tmdb_data, kobis_df, youtube_df):
+    total_audience = 0
+    if not kobis_df.empty and "누적관객수" in kobis_df.columns:
+        total_audience = int(kobis_df["누적관객수"].max())
+
+    total_views = 0
+    if not youtube_df.empty and "view_count" in youtube_df.columns:
+        total_views = int(youtube_df["view_count"].sum())
+
+    return {
+        "총 관객수": total_audience,
+        "TMDB 인기지수": round(tmdb_data["popularity"], 1) if tmdb_data else 0,
+        "예고편 조회수": total_views,
+        "러닝타임": tmdb_data["runtime"] if tmdb_data else 0,
+        "TMDB 평점": round(tmdb_data["vote_average"], 1) if tmdb_data else 0,
+    }
+
+
+st.sidebar.title("실시간 영화 분석")
+selected_movie = st.sidebar.selectbox("영화 선택", list(MOVIE_MAP.keys()))
+movie_info = MOVIE_MAP[selected_movie]
+
+with st.spinner("API에서 데이터를 불러오는 중..."):
+    tmdb_data = fetch_tmdb_movie(movie_info["tmdb_query"])
+    release_date = tmdb_data["release_date"] if tmdb_data else None
+    kobis_df = fetch_kobis_boxoffice(movie_info["kobis_name"], release_date, days=120)
+    youtube_df = fetch_youtube_stats(movie_info["youtube_queries"])
+
+metrics = build_metrics(tmdb_data, kobis_df, youtube_df)
+
+st.title(f"실시간 영화 분석")
+st.subheader(f"영화 '{selected_movie}' 데이터 기반 분석")
+
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("총 관객수", f"{metrics['총 관객수']:,}명")
+col2.metric("TMDB 인기지수", metrics["TMDB 인기지수"])
+col3.metric("예고편 조회수", f"{metrics['예고편 조회수']:,}회")
+col4.metric("러닝타임", f"{metrics['러닝타임']}분")
+col5.metric("TMDB 평점", metrics["TMDB 평점"])
+
+st.markdown("---")
+
+left, right = st.columns(2)
+
+with left:
+    st.subheader("1. 일별 관객수 추이")
+    if not kobis_df.empty:
+        fig_daily = px.bar(
+            kobis_df,
+            x="날짜",
+            y="일별관객수",
+            title="일별 관객수",
+        )
+        st.plotly_chart(fig_daily, use_container_width=True)
+    else:
+        st.info("KOBIS 관객 데이터를 찾지 못했습니다.")
+
+with right:
+    st.subheader("2. 누적 관객수 성장 추이")
+    if not kobis_df.empty:
+        fig_acc = px.line(
+            kobis_df,
+            x="날짜",
+            y="누적관객수",
+            title="누적 관객수 성장",
+        )
+        st.plotly_chart(fig_acc, use_container_width=True)
+    else:
+        st.info("누적 관객수 데이터를 표시할 수 없습니다.")
+
+left2, right2 = st.columns(2)
+
+with left2:
+    st.subheader("3. YouTube 조회수 상위 영상")
+    if not youtube_df.empty:
+        fig_yt = px.bar(
+            youtube_df.head(10),
+            x="title",
+            y="view_count",
+            title="예고편/관련 영상 조회수",
+        )
         st.plotly_chart(fig_yt, use_container_width=True)
+    else:
+        st.info("YouTube 데이터를 찾지 못했습니다.")
 
-    with row2_col2:
-        st.subheader("4. 누적 관객수 성장 추이")
-        # 개봉일로부터의 경과일 계산 (비교를 위해)
-        # 여기서는 단순 날짜 기반 추이
-        fig_growth = px.line(filtered_daily, x='date', y='accum_audience', color='movie_title',
-                             title="개봉 이후 관객 성정 곡선")
-        st.plotly_chart(fig_growth, use_container_width=True)
-
-    st.divider()
-
-    # 인사이트 요약 섹션
-    st.subheader("💡 '왕과 사는 남자' 인사이트 요약")
-    
-    insight_text = """
-    - **폭발적인 화제성**: 유튜브 예고편 조회수와 초기 관객 동원력 간의 강한 상관관계가 관찰됨.
-    - **천만 돌파의 원동력**: 개봉 2주차까지의 관객 드롭률이 매우 낮으며, 오히려 주말 관객수가 상승하는 '입소문 효과'가 뚜렷함.
-    - **비교 분석**: {0}와 {1} 등 기존 천만 영화들과 비교했을 때, 초기 7일간의 관객 점유율이 역대급 수치를 기록함.
-    """.format("명량", "기생충")
-    
-    st.info(insight_text)
-
-    # 데이터 상세 보기
-    if st.checkbox("전체 데이터 보기"):
-        st.subheader("Raw Data - Master Dataset")
-        st.dataframe(filtered_master)
-
-except Exception as e:
-    st.error(f"데이터를 불러오는 중 오류가 발생했습니다: {e}")
-    st.info("먼저 수집 및 전처리 스크립트(process_data.py 등)를 실행하여 데이터셋을 생성해 주세요.")
+with right2:
+    st.subheader("4. 영화 기본 정보")
+    if tmdb_data:
+        st.write(f"**제목**: {tmdb_data['title']}")
+        st.write(f"**개봉일**: {tmdb_data['release_date']}")
+        st.write(f"**장르**: {tmdb_data['genres']}")
+        st.write(f"**줄거리**: {tmdb_data['overview']}")
+    else:
+        st.info("TMDB 영화 정보를 불러오지 못했습니다.")
